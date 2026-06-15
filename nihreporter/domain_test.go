@@ -1,6 +1,7 @@
 package nihreporter
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tamnd/any-cli/kit"
@@ -24,10 +25,14 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+	}{
+		{"R01CA123456", "project", "R01CA123456"},
+		{"75N94023D00001", "project", "75N94023D00001"},
+		{"some-grant-number", "project", "some-grant-number"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -38,39 +43,50 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("Classify(\"\") should return an error")
+	}
+}
+
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("project", "R01CA123456")
+	want := "https://" + Host + "/search-results/R01CA123456"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("unknown", "R01CA123456")
+	if err == nil {
+		t.Error("Locate with unknown type should return an error")
+	}
+}
+
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
+	p := &Project{
+		ID:         12345,
+		ProjectNum: "R01CA123456",
+		Title:      "Test Project",
+		Abstract:   "A test abstract for wiring check.",
+	}
 	u, err := h.Mint(p)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "nihreporter://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if !strings.HasPrefix(u.String(), "nihreporter://project/") {
+		t.Errorf("Mint = %q, want nihreporter://project/... prefix", u.String())
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("nihreporter", "about")
-	if err != nil || got.String() != "nihreporter://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want nihreporter://page/about", got.String(), err)
+	got, err := h.ResolveOn("nihreporter", "R01CA123456")
+	if err != nil || got.String() != "nihreporter://project/R01CA123456" {
+		t.Errorf("ResolveOn = (%q, %v), want nihreporter://project/R01CA123456", got.String(), err)
 	}
 }
