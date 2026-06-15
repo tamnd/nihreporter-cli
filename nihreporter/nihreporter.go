@@ -1,115 +1,142 @@
 // Package nihreporter is the library behind the nihreporter command line:
-// the HTTP client, request shaping, and the typed data models for nihreporter.
+// the HTTP client, request shaping, and the typed data models for the NIH
+// Reporter API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
+// transient failures (429 and 5xx) that any public API throws under load.
 // Build your endpoint calls and JSON decoding on top of it.
 package nihreporter
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to nihreporter. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "nihreporter/dev (+https://github.com/tamnd/nihreporter-cli)"
+// Host is the NIH Reporter site, used for Locate / URI resolution.
+const Host = "reporter.nih.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at nihreporter.com; change it once you
-// know the real endpoints you want to read.
-const Host = "nihreporter.com"
+// --- Config ---
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to nihreporter over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config carries the tunable parameters for the NIH Reporter client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+// DefaultConfig returns a Config with sensible defaults for the NIH Reporter API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://api.reporter.nih.gov/v2",
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: "nihreporter-cli/0.1.0 (github.com/tamnd/nihreporter-cli)",
+	}
+}
+
+// --- Client ---
+
+// Client talks to the NIH Reporter API over HTTP.
+type Client struct {
+	HTTP *http.Client
+	cfg  Config
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with the default config.
 func NewClient() *Client {
+	return NewClientWithConfig(DefaultConfig())
+}
+
+// NewClientWithConfig returns a Client using the given config.
+func NewClientWithConfig(cfg Config) *Client {
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "https://api.reporter.nih.gov/v2"
+	}
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// post sends a POST request with a JSON body and decodes the JSON response into dst.
+func (c *Client) post(ctx context.Context, endpoint string, body any, dst any) error {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		retry, err := c.doPost(ctx, endpoint, body, dst)
 		if err == nil {
-			return body, nil
+			return nil
 		}
 		lastErr = err
 		if !retry {
-			return nil, err
+			return err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return fmt.Errorf("post %s: %w", endpoint, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) doPost(ctx context.Context, endpoint string, body any, dst any) (retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+
+	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, false, err
+		return false, fmt.Errorf("marshal request: %w", err)
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+
+	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/" + strings.TrimLeft(endpoint, "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, true, err
+		return true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
+		return true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+		return false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, true, err
+		return true, err
 	}
-	return b, false, nil
+	if err := json.Unmarshal(b, dst); err != nil {
+		return false, fmt.Errorf("decode response: %w", err)
+	}
+	return false, nil
 }
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +150,194 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on nihreporter.com. It is a stand-in for the typed records you
-// will model from the real nihreporter endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `nihreporter cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (unexported) ---
+
+type wireMeta struct {
+	Total  int `json:"total"`
+	Offset int `json:"offset"`
+	Limit  int `json:"limit"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
+type wireProject struct {
+	ApplID       int    `json:"appl_id"`
+	ProjectNum   string `json:"project_num"`
+	ProjectTitle string `json:"project_title"`
+	AbstractText string `json:"abstract_text"`
+	FiscalYear   int    `json:"fiscal_year"`
+	AwardAmount  int64  `json:"award_amount"`
+	ProjectStart string `json:"project_start_date"`
+	ProjectEnd   string `json:"project_end_date"`
+	PINames      []struct {
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+		IsContact bool   `json:"is_contact_pi"`
+	} `json:"pi_names"`
+	OrgName      string  `json:"org_name"`
+	OrgState     string  `json:"org_state"`
+	OrgCity      string  `json:"org_city"`
+	ActivityCode string  `json:"activity_code"`
+	Terms        string  `json:"terms"`
+	AgencyCode   string  `json:"agency_code"`
+	SubprojectID *string `json:"subproject_id"`
+}
+
+type wireSearchResponse struct {
+	Meta    wireMeta      `json:"meta"`
+	Results []wireProject `json:"results"`
+}
+
+// --- public output types ---
+
+// Project is an NIH research grant record.
+type Project struct {
+	ID           int      `json:"id"            kit:"id"` // appl_id
+	ProjectNum   string   `json:"project_num"`
+	Title        string   `json:"title"`
+	Abstract     string   `json:"abstract,omitempty"`
+	FiscalYear   int      `json:"fiscal_year,omitempty"`
+	AwardAmount  int64    `json:"award_amount,omitempty"`
+	StartDate    string   `json:"start_date,omitempty"`
+	EndDate      string   `json:"end_date,omitempty"`
+	PINames      []string `json:"pi_names,omitempty"`
+	OrgName      string   `json:"org_name,omitempty"`
+	OrgState     string   `json:"org_state,omitempty"`
+	ActivityCode string   `json:"activity_code,omitempty"`
+	Agency       string   `json:"agency,omitempty"`
+	Terms        []string `json:"terms,omitempty"`
+}
+
+// projectFromWire converts a wire project into the public Project type.
+func projectFromWire(wp wireProject) *Project {
+	var piNames []string
+	for _, pi := range wp.PINames {
+		name := strings.TrimSpace(pi.FirstName + " " + pi.LastName)
+		if name == "" {
+			name = pi.LastName
+		}
+		if name != "" {
+			piNames = append(piNames, name)
+		}
+	}
+
+	var terms []string
+	for _, t := range strings.Split(wp.Terms, ";") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			terms = append(terms, t)
+		}
+	}
+
+	return &Project{
+		ID:           wp.ApplID,
+		ProjectNum:   wp.ProjectNum,
+		Title:        wp.ProjectTitle,
+		Abstract:     wp.AbstractText,
+		FiscalYear:   wp.FiscalYear,
+		AwardAmount:  wp.AwardAmount,
+		StartDate:    wp.ProjectStart,
+		EndDate:      wp.ProjectEnd,
+		PINames:      piNames,
+		OrgName:      wp.OrgName,
+		OrgState:     wp.OrgState,
+		ActivityCode: wp.ActivityCode,
+		Agency:       wp.AgencyCode,
+		Terms:        terms,
+	}
+}
+
+// --- search request helpers ---
+
+type searchRequest struct {
+	Criteria any `json:"criteria"`
+	Offset   int `json:"offset"`
+	Limit    int `json:"limit"`
+}
+
+type textSearchCriteria struct {
+	TextSearch struct {
+		SearchText  string `json:"search_text"`
+		SearchField string `json:"search_field"`
+	} `json:"text_search"`
+}
+
+type piSearchCriteria struct {
+	PINames []struct {
+		LastName string `json:"last_name"`
+	} `json:"pi_names"`
+}
+
+type orgSearchCriteria struct {
+	OrgNames []string `json:"org_names"`
+}
+
+type projectNumCriteria struct {
+	ProjectNums []string `json:"project_nums"`
+}
+
+// --- client methods ---
+
+// SearchProjects searches grants by text query.
+func (c *Client) SearchProjects(ctx context.Context, query string, limit, offset int) ([]*Project, int, error) {
+	var crit textSearchCriteria
+	crit.TextSearch.SearchText = query
+	crit.TextSearch.SearchField = "all"
+
+	req := searchRequest{Criteria: crit, Offset: offset, Limit: limit}
+	var resp wireSearchResponse
+	if err := c.post(ctx, "projects/search", req, &resp); err != nil {
+		return nil, 0, err
+	}
+	return projectsFromWire(resp.Results), resp.Meta.Total, nil
+}
+
+// SearchByPI searches grants by PI last name.
+func (c *Client) SearchByPI(ctx context.Context, lastName string, limit, offset int) ([]*Project, int, error) {
+	crit := piSearchCriteria{
+		PINames: []struct {
+			LastName string `json:"last_name"`
+		}{{LastName: lastName}},
+	}
+
+	req := searchRequest{Criteria: crit, Offset: offset, Limit: limit}
+	var resp wireSearchResponse
+	if err := c.post(ctx, "projects/search", req, &resp); err != nil {
+		return nil, 0, err
+	}
+	return projectsFromWire(resp.Results), resp.Meta.Total, nil
+}
+
+// SearchByOrg searches grants by organization name.
+func (c *Client) SearchByOrg(ctx context.Context, orgName string, limit, offset int) ([]*Project, int, error) {
+	crit := orgSearchCriteria{OrgNames: []string{orgName}}
+
+	req := searchRequest{Criteria: crit, Offset: offset, Limit: limit}
+	var resp wireSearchResponse
+	if err := c.post(ctx, "projects/search", req, &resp); err != nil {
+		return nil, 0, err
+	}
+	return projectsFromWire(resp.Results), resp.Meta.Total, nil
+}
+
+// GetProject fetches a single project by project number.
+func (c *Client) GetProject(ctx context.Context, projectNum string) (*Project, error) {
+	crit := projectNumCriteria{ProjectNums: []string{projectNum}}
+
+	req := searchRequest{Criteria: crit, Offset: 0, Limit: 1}
+	var resp wireSearchResponse
+	if err := c.post(ctx, "projects/search", req, &resp); err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	if len(resp.Results) == 0 {
+		return nil, fmt.Errorf("project %s: not found", projectNum)
+	}
+	return projectFromWire(resp.Results[0]), nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// projectsFromWire converts a slice of wire projects to public Project records.
+func projectsFromWire(wps []wireProject) []*Project {
+	out := make([]*Project, 0, len(wps))
+	for _, wp := range wps {
+		out = append(out, projectFromWire(wp))
 	}
 	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
